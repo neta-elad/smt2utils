@@ -129,6 +129,13 @@ impl QiFrame {
             Discovered { quantifier, .. } | NewMatch { quantifier, .. } => quantifier,
         }
     }
+
+    pub fn terms(&self) -> &Vec<Ident> {
+        use QiFrame::*;
+        match self {
+            Discovered { terms, .. } | NewMatch { terms, .. } => terms,
+        }
+    }
 }
 
 /// Data specific to an instance of a quantifier instantiation (i.e. gathered
