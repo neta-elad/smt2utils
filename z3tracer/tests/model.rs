@@ -11,7 +11,7 @@ use z3tracer::{syntax::Ident, Model, ModelConfig};
 fn process_file(path: &str) -> anyhow::Result<Model> {
     let file = std::io::BufReader::new(std::fs::File::open(path)?);
     let mut model = Model::default();
-    model.process(Some(path.to_string()), file)?;
+    model.process(Some(path.to_string()), file, 0)?;
     Ok(model)
 }
 
@@ -20,7 +20,7 @@ fn process_file_with_line_skipping(path: &str) -> anyhow::Result<Model> {
     let mut config = ModelConfig::default();
     config.parser_config.ignore_invalid_lines = true;
     let mut model = Model::new(config);
-    model.process(Some(path.to_string()), file)?;
+    model.process(Some(path.to_string()), file, 0)?;
     Ok(model)
 }
 
