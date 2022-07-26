@@ -228,15 +228,17 @@ fn main() {
             }
         }
 
-        let mut quant_costs = model.quant_costs();
-        println!("Got {} costs", quant_costs.len());
-        quant_costs.sort_by_key(|v| v.instantiations * v.cost);
-        quant_costs.reverse();
-        for cost in quant_costs {
-            println!(
-                "{} created {} instantiations and cost {}",
-                cost.quant, cost.instantiations, cost.cost
-            );
+        if !options.config.annotated_proof {
+            let mut quant_costs = model.quant_costs();
+            println!("Got {} costs", quant_costs.len());
+            quant_costs.sort_by_key(|v| v.instantiations * v.cost);
+            quant_costs.reverse();
+            for cost in quant_costs {
+                println!(
+                    "{} created {} instantiations and cost {}",
+                    cost.quant, cost.instantiations, cost.cost
+                );
+            }
         }
 
         if !options.plot_instantiations

@@ -7,6 +7,7 @@ use petgraph::visit::DfsPostOrder;
 use petgraph::Direction;
 use smt2parser::concrete::Symbol;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::fmt::Write;
 use structopt::StructOpt;
 
 use crate::{
@@ -30,6 +31,14 @@ pub struct ModelConfig {
     /// Whether to log quantifier instantiations (QIs).
     #[structopt(long)]
     pub display_qi_logs: bool,
+
+    /// Whether to show detailed instantiations
+    #[structopt(long)]
+    pub detailed_instantiations: bool,
+
+    /// Whether to show annotated proof to find least instantiations
+    #[structopt(long)]
+    pub annotated_proof: bool,
 
     /// Whether to display variable instantiations in QIs
     #[structopt(long)]
@@ -341,9 +350,38 @@ impl Model {
         // triggered U
         let mut graph = Graph::<QiKey, ()>::new();
         let mut node_map = HashMap::new();
-        for (qi_key, _) in quantifier_inst_matches.clone() {
+        let genv = BTreeMap::new();
+        for (qi_key, qi_instance) in quantifier_inst_matches.clone() {
             let index = graph.add_node(*qi_key);
             node_map.insert(qi_key, index);
+
+            if !self.config.detailed_instantiations {
+                continue;
+            }
+
+            let quantifier = self.term(qi_instance.frame.quantifier()).unwrap();
+
+            if let Term::Quant {
+                name,
+                var_names: Some(var_names),
+                body,
+                ..
+            } = quantifier
+            {
+                println!(
+                    "quantifier {} = {}",
+                    name,
+                    self.id_to_sexp(&genv, body).unwrap()
+                );
+                for (i, term) in qi_instance.frame.terms().iter().enumerate() {
+                    let var_name = var_names.get(i).unwrap();
+                    println!(
+                        "qi-instance-term {} = {}",
+                        var_name.name,
+                        self.id_to_sexp(&genv, term).unwrap()
+                    );
+                }
+            }
         }
         for (qi_key, quant_inst) in quantifier_inst_matches.clone() {
             match &quant_inst.frame {
@@ -598,7 +636,12 @@ impl Model {
                     .collect::<RawResult<Vec<_>>>()?
                     .join(" ");
                 Ok(format!(
-                    "(QUANT ({}) (! {} :qid {} {}))",
+                    "({} ({}) (! {} :qid {} {}))",
+                    if self.config.annotated_proof {
+                        "forall"
+                    } else {
+                        "QUANT"
+                    },
                     vars,
                     self.id_to_sexp(&venv, body)?,
                     name,
@@ -692,7 +735,7 @@ impl Model {
                             _ => trigger,
                         };
                         println!("{} :: {{ {} }}", name, self.id_to_sexp(&venv, trigger)?);
-                    } else {
+                    } else if !self.config.annotated_proof {
                         println!("{}", name);
                     }
                     // Print instantiation terms.
@@ -721,6 +764,45 @@ impl Model {
                                         self.id_to_sexp(&global_venv, id2)?
                                     );
                                 }
+                            }
+                        }
+                    }
+                    if self.config.annotated_proof {
+                        let quantifier_name = name.as_str();
+                        let mut terms_string = String::new();
+                        for u in used {
+                            use MatchedTerm::*;
+                            match u {
+                                Trigger(id) => {
+                                    write!(
+                                        &mut terms_string,
+                                        ", {}",
+                                        self.id_to_sexp(&global_venv, id)?
+                                    )
+                                    .expect("Could not write terms string");
+                                }
+                                Equality(id1, id2) => {
+                                    write!(
+                                        &mut terms_string,
+                                        ", {} == {}",
+                                        self.id_to_sexp(&global_venv, id1)?,
+                                        self.id_to_sexp(&global_venv, id2)?
+                                    )
+                                    .expect("Could not write terms string");
+                                }
+                            }
+                        }
+                        for instance in &inst.instances {
+                            if let Term::Proof { property, .. } = self
+                                .term(instance.term.as_ref().ok_or(RawError::MissingIdentifier)?)?
+                            {
+                                let p = self.term(property)?;
+                                println!(
+                                    "(assert (! {} :named |{}{}|))",
+                                    self.term_to_sexp(&global_venv, p)?,
+                                    quantifier_name,
+                                    terms_string
+                                );
                             }
                         }
                     }
@@ -1244,7 +1326,7 @@ impl LogVisitor for &mut Model {
         self.term_data_mut(&quantifier)?
             .instantiation_timestamps
             .push(timestamp);
-        if self.config.display_qi_logs {
+        if self.config.display_qi_logs || self.config.annotated_proof {
             self.log_instance(key)?;
         }
         Ok(())
