@@ -594,6 +594,14 @@ impl Model {
             } => {
                 if args.is_empty() {
                     Ok(name.to_string())
+                } else if name == "pattern" && args.len() == 1 {
+                    Ok(format!(
+                        "({})",
+                        args.iter()
+                            .map(|id| self.id_to_sexp(venv, id))
+                            .collect::<RawResult<Vec<_>>>()?
+                            .join(" ")
+                    ))
                 } else {
                     Ok(format!(
                         "({} {})",
@@ -616,10 +624,14 @@ impl Model {
                 body,
                 var_names,
             } => {
+                let original_venv = venv;
                 let mut venv = venv.clone();
                 let vars = match var_names {
                     None => format!("{}", params),
                     Some(var_names) => {
+                        for (key, value) in original_venv.iter() {
+                            venv.insert(*key + var_names.len() as u64, value.clone());
+                        }
                         for (i, vn) in var_names.iter().enumerate() {
                             venv.insert(i as u64, vn.name.clone());
                         }
