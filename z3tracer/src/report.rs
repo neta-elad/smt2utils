@@ -20,6 +20,31 @@ pub fn process_file(config: ModelConfig, path: &std::path::Path) -> std::io::Res
     if let Err(le) = model.process(path.to_str().map(String::from), file, line_count) {
         eprintln!("Error at {:?}: {:?}", le.position, le.error);
     }
+
+    
+
+    if model.config().detailed_skolemization {
+        let genv = BTreeMap::new();
+        for term_data in model.terms().values() {
+            let term = &term_data.term;
+            if let Term::Proof {
+                name,
+                args,
+                property,
+            } = term
+            {
+                if name == "sk" {
+                    println!(
+                        "found skolemization {:?} {:?} which is missing {} variables",
+                        args,
+                        model.id_to_sexp(&genv, property),
+                        model.free_variables_missing(property, 0).expect("Could not find if term is closed"),                    
+                    );
+                }
+            }
+        }
+    }
+
     Ok(model)
 }
 

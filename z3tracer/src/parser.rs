@@ -179,8 +179,10 @@ where
                     args,
                     property,
                 };
+                
                 state.add_term(id, term)?;
                 lexer.read_end_of_line()?;
+
                 Ok(true)
             }
             "[attach-meaning]" => {

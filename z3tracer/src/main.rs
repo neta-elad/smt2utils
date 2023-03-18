@@ -3,12 +3,12 @@
 
 #![forbid(unsafe_code)]
 
-use z3tracer::{report::*, Model, ModelConfig};
+use z3tracer::{report::*, syntax::Term, Model, ModelConfig};
 
 use multiset::HashMultiSet;
 use petgraph::graph::Graph;
 use plotters::prelude::*;
-use std::{collections::*, io::Write, path::PathBuf};
+use std::{collections::*, io::Write, path::PathBuf, fs::File, io};
 use structopt::StructOpt;
 
 /// Test utility for the parsing and the analysis of Z3 log files.
@@ -74,6 +74,12 @@ struct Options {
     /// How many instantiations to represent.
     #[structopt(long, default_value = "10")]
     keep_top_instantiations: usize,
+
+    #[structopt(long, parse(from_os_str))]
+    instantiation_tree: Option<PathBuf>,
+
+    #[structopt(long, parse(from_os_str))]
+    flat_instantiations: Option<PathBuf>,
 
     /// Path to the Z3 log files.
     #[structopt(parse(from_os_str))]
@@ -226,6 +232,20 @@ fn main() {
             for inst in model.instantiations() {
                 println!("Instantiation: {:?}", inst);
             }
+        }
+
+        if let Some(flat) = &options.flat_instantiations {
+            print_flat_instantiations(flat, &model)
+                .expect("Could not write flat instantiations");
+
+            continue;
+        }
+
+        if let Some(tree) = &options.instantiation_tree {
+            print_instantiation_tree(tree, &model)
+                .expect("Could not write instantiation tree");
+
+            continue;
         }
 
         if !options.config.annotated_proof {
@@ -399,4 +419,102 @@ fn main() {
                 .expect("Error running `dot` (is graphviz installed?)");
         }
     }
+}
+
+fn print_flat_instantiations(target: &PathBuf, model: &Model) -> io::Result<()> {
+    println!("Found {} instantiations", model.instantiations().len());
+    let mut builtins = 0;
+    let mut file = File::create(target)?;
+    for (_key, inst) in model.instantiations() {
+        let qident = inst.frame.quantifier();
+
+        if qident.is_builtin() {
+            builtins += 1;
+            continue;
+        }
+
+        let quantifier = model.term(qident).expect("MISSING QIDENT");
+
+        if let Term::Quant {
+            name,
+            body,
+            var_names: Some(var_names),
+            ..
+        } = quantifier {
+            // Bind variable names.
+            let mut venv = BTreeMap::new();
+            for (i, vn) in var_names.iter().enumerate() {
+                // inst.frame.terms().get(i)
+                venv.insert(i as u64, vn.name.clone());
+            }
+            
+            write!(file, "{}\n", name)?;
+            write!(file, "{}\n", &model.id_to_sexp(&venv, &body).expect("Could not build body"))?;
+
+            let terms = inst.frame.terms();
+
+            for (i, term) in terms.iter().enumerate() {
+                write!(file, "{} = {}\n", &var_names[i].name, &model.id_to_sexp(&venv, &term).expect("Could not build term"))?;
+            }
+
+            write!(file, "[end]\n")?;
+        }
+    }
+
+    println!("Found {} builtins", builtins);
+    Ok(())
+}
+
+fn print_instantiation_tree(target: &PathBuf, model: &Model) -> io::Result<()> {
+    println!("Found {} instantiations", model.instantiations().len());
+    let mut builtins = 0;
+    let mut file = File::create(target)?;
+    for (key, inst) in model.instantiations() {
+        let qident = inst.frame.quantifier();
+
+        if qident.is_builtin() {
+            builtins += 1;
+            continue;
+        }
+
+        let terms = inst.frame.terms();
+
+        let quantifier = model.term(qident).expect("MISSING QIDENT");
+        if let Term::Quant {
+            name,
+            var_names: Some(var_names),
+            ..
+        } = quantifier
+        {
+            write!(file, "{:?}", key)?;
+
+            write!(file, " {} [", name)?;
+            let vars = var_names
+                .iter()
+                .enumerate()
+                .map(|(i, var)| {
+                    format!(
+                        "{}={}",
+                        var.name.clone(),
+                        model.global_id_to_sexp(&terms[i]).expect("MISSING ID")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            write!(file, "{}]", vars)?;
+            
+            if let Ok(parent) = model.get_parent(qident) {
+                write!(file, " {:?}", parent)?;
+            }
+
+            if name.contains("51:18!3") {
+                println!("{:?} {:?}\n>{}", qident, model.scoped_term_data(qident), 
+                    model.global_id_to_sexp(qident).unwrap());
+            }
+
+            write!(file, "\n")?;
+        }
+    }
+    println!("Found {} builtins", builtins);
+    Ok(())
 }

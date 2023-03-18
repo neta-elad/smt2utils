@@ -90,7 +90,7 @@ impl std::fmt::Debug for Position {
 }
 
 const SUPPORTED_TOOL: &str = "Z3";
-const SUPPORTED_VERSIONS: &[&str] = &["4.8.9"];
+const SUPPORTED_VERSIONS: &[&str] = &["4.8.9", "4.9.1"];
 
 impl RawError {
     pub fn check_that_tool_version_is_supported(s1: &str, s2: &str) -> RawResult<()> {

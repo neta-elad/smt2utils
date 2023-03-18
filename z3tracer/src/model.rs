@@ -6,9 +6,11 @@ use petgraph::graph::Graph;
 use petgraph::visit::DfsPostOrder;
 use petgraph::Direction;
 use smt2parser::concrete::Symbol;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fmt::Write;
 use structopt::StructOpt;
+use std::hash::{Hasher, Hash};
 
 use crate::{
     error::{RawError, RawResult, Result},
@@ -16,7 +18,7 @@ use crate::{
     parser::{LogVisitor, Parser, ParserConfig},
     syntax::{
         Equality, Ident, Literal, MatchedTerm, Meaning, QiFrame, QiInstance, QiKey, Term, VarName,
-        Visitor,
+        Visitor
     },
 };
 
@@ -67,6 +69,9 @@ pub struct ModelConfig {
     /// Whether to run consistency checks for identifiers, equations, etc.
     #[structopt(long)]
     pub skip_log_consistency_checks: bool,
+
+    #[structopt(long)]
+    pub detailed_skolemization: bool,
 }
 
 /// Information on a term in the model.
@@ -222,6 +227,8 @@ pub struct Model {
     scopes: Vec<Scope>,
     // Current scope.
     current_scope: Scope,
+    // Known quantifiers
+    known_quantifiers: BTreeMap<u64, QiKey>,
 }
 
 impl Assignment {
@@ -242,6 +249,28 @@ fn maybe_index_min(i: Option<usize>, j: Option<usize>) -> Option<usize> {
     }
 }
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static NAMED_ID: AtomicUsize = AtomicUsize::new(0);
+
+fn next_id() -> usize {
+    NAMED_ID.fetch_add(1, Ordering::SeqCst)
+}
+
+fn symbol_to_string(symbol: &str) -> String {
+    if symbol == "if" {
+        return "ite".to_owned()
+    }
+
+    let mut string = symbol.to_string();
+    if symbol.contains("#") {
+        string.insert(symbol.len(), '|');
+        string.insert(0, '|');
+    }
+
+    string
+}
+
 impl Model {
     /// Build a new Z3 tracer.
     /// Experimental. Use `Model::default()` instead if possible.
@@ -250,6 +279,10 @@ impl Model {
             config,
             ..Model::default()
         }
+    }
+
+    pub fn config(&self) -> &ModelConfig {
+        &self.config
     }
 
     /// Process some input.
@@ -275,6 +308,10 @@ impl Model {
     /// All instantiations in the model.
     pub fn instantiations(&self) -> &BTreeMap<QiKey, QuantInstantiation> {
         &self.instantiations
+    }
+
+    pub fn known_quantifiers(&self) -> &BTreeMap<u64, QiKey> {
+        &self.known_quantifiers
     }
 
     /// Number of Z3 logs that were processed.
@@ -322,6 +359,37 @@ impl Model {
             .ok_or_else(|| RawError::UndefinedIdent(id.clone()))?
             .term;
         Ok(t)
+    }
+
+    pub fn is_closed(&self, id: &Ident) -> RawResult<bool> {
+        Ok(self.free_variables_missing(id, 0)? == 0)
+    }
+
+    pub fn free_variables_missing(&self, id: &Ident, variables: u64) -> RawResult<u64> {
+        use Term::*;
+        match self.term(id)? {
+            App { args, .. } => args.iter().try_fold(0, |acc, x| {
+                Ok(acc.max(self.free_variables_missing(x, variables)?))
+            }),
+            Var { index } => Ok(if index < &variables {
+                0
+            } else {
+                1 + index - variables
+            }),
+            Quant {
+                body, var_names, ..
+            } => self.free_variables_missing(
+                body,
+                variables
+                    + var_names
+                        .as_ref()
+                        .map(|vars| vars.len() as u64)
+                        .unwrap_or(0),
+            ),
+            Lambda { params, body, .. } => self.free_variables_missing(body, variables + params),
+            Proof { property, .. } => self.free_variables_missing(property, variables),
+            Builtin { .. } => Ok(0),
+        }
     }
 
     /// Calculate the cost imposed by each quantifier
@@ -493,6 +561,132 @@ impl Model {
         quant_cost.into_values().collect::<Vec<_>>()
     }
 
+    pub fn get_parent(&self, id: &Ident) -> RawResult<&QiKey> {
+        let hash = self.auto_hash_term(id)?;
+        self.known_quantifiers.get(&hash).ok_or(RawError::MissingIdentifier)
+        // if let Some(parent) = self.known_quantifiers.get(&hash) {
+        //     Ok(parent)
+        // } else {
+        //     let hash = self.auto_hash_term(&self.eq_class(id))?;
+            
+        // }
+    }
+
+    pub fn auto_hash_term(&self, id: &Ident) -> RawResult<u64> {
+        let mut hasher = DefaultHasher::new();
+        Ok(self.hash_term(&mut hasher, &self.eq_class(id))?.finish())
+    }
+
+    pub fn hash_term<'a, H: Hasher,>(&self, mut hasher: &'a mut H, id: &Ident) -> RawResult<&'a mut H> {
+        let term = self.term(id)?;
+        use Term::*;
+
+        match term {
+            App { meaning: Some(meaning), .. } => {
+                meaning.hash(hasher);
+            }
+            App {
+                name,
+                args,
+                ..
+            } => {
+                name.hash(hasher);
+                for arg in args {
+                    hasher = self.hash_term(hasher, arg)?;
+                }
+            }
+            Quant { name, params, triggers, body, var_names } => {
+                name.hash(hasher);
+                params.hash(hasher);
+
+                for arg in triggers {
+                    hasher = self.hash_term(hasher, arg)?;
+                }
+
+                hasher = self.hash_term(hasher, body)?;
+
+                var_names.hash(hasher);
+            },
+            Lambda { name, params, triggers, body } => {
+                name.hash(hasher);
+                params.hash(hasher);
+
+
+                for arg in triggers {
+                    hasher = self.hash_term(hasher, arg)?;
+                }
+
+                hasher = self.hash_term(hasher, body)?;
+            },
+            Proof { name, args, property } => {
+                name.hash(hasher);
+
+                for arg in args {
+                    hasher = self.hash_term(hasher, arg)?;
+                }
+
+                hasher = self.hash_term(hasher, property)?;
+            },
+            Var { index } => {
+                index.hash(hasher);
+            },
+            Builtin { name } => {
+                name.hash(hasher);
+            }
+        }
+
+        Ok(hasher)
+    }
+
+    fn find_unknown_quantifiers(&self, id: &Ident) -> RawResult<BTreeSet<u64>> {
+        // println!("finding unknown {:?}", id);
+        let term = self.term(id)?;
+        let mut unknowns = BTreeSet::new();
+
+        use Term::*;
+
+        match term {
+            App {
+                args,
+                ..
+            } => {
+                for arg in args {
+                    unknowns.append(&mut self.find_unknown_quantifiers(arg)?);
+                }
+            }
+            Quant { name, body, .. } => {
+                if name.contains("PagedBetreeidfy.51:18!3") {
+                    println!("@ {:?} {}", id, self.global_id_to_sexp(id)?);
+                }
+
+                let hash = self.auto_hash_term(id)?;
+
+                if !self.known_quantifiers.contains_key(&hash) {
+                    // println!("added {:?} as {:?}", id, hash);
+                    unknowns.insert(hash);
+                    unknowns.append(&mut self.find_unknown_quantifiers(body)?);
+                }
+
+                // let eq_id = self.eq_class(id);
+                // let eq_hash = self.auto_hash_term(&eq_id)?;
+
+                // if !self.known_quantifiers.contains_key(&eq_hash) {
+                //     println!("added {:?} (which is eq to {:?}) as {:?}", id, eq_id, eq_hash);
+                //     unknowns.insert(eq_hash);
+                // }
+            },
+            Lambda { body, .. } => {
+                unknowns.append(&mut self.find_unknown_quantifiers(body)?);
+            },
+            Proof { property , .. } => {
+                unknowns.append(&mut self.find_unknown_quantifiers(property)?);
+            },
+            _ => {},
+        }
+
+        Ok(unknowns)
+    }
+
     // Obtain a writeable entry in the current scope. The first time, this will trigger a
     // "copy-on-write" from the most recent ancestor scope that knows about `id` (if any).
     fn scoped_term_data_mut(&mut self, id: &Ident) -> &mut ScopedTermData {
@@ -507,7 +701,7 @@ impl Model {
     }
 
     // Access the most recent scoped information about `id`.
-    fn scoped_term_data(&self, id: &Ident) -> &ScopedTermData {
+    pub fn scoped_term_data(&self, id: &Ident) -> &ScopedTermData {
         static DEFAULT: Lazy<ScopedTermData> = Lazy::new(ScopedTermData::default);
         let mut scope = &self.current_scope;
         loop {
@@ -523,6 +717,10 @@ impl Model {
                 }
             }
         }
+    }
+
+    pub fn eq_class(&self, id: &Ident) -> Ident {
+        self.scoped_term_data(id).eq_class.as_ref().unwrap_or(id).clone()
     }
 
     fn term_assignment(&self, id: &Ident) -> Option<&Assignment> {
@@ -574,6 +772,11 @@ impl Model {
         Ok(t)
     }
 
+    pub fn global_id_to_sexp(&self, id: &Ident) -> RawResult<String> {
+        let global_venv = BTreeMap::new();
+        self.id_to_sexp(&global_venv, id)
+    }
+
     /// Display a term given by id.
     pub fn id_to_sexp(&self, venv: &BTreeMap<u64, Symbol>, id: &Ident) -> RawResult<String> {
         self.term_to_sexp(venv, self.term(id)?)
@@ -593,7 +796,7 @@ impl Model {
                 meaning: None,
             } => {
                 if args.is_empty() {
-                    Ok(name.to_string())
+                    Ok(symbol_to_string(name))
                 } else if name == "pattern" && args.len() == 1 {
                     Ok(format!(
                         "({})",
@@ -605,7 +808,7 @@ impl Model {
                 } else {
                     Ok(format!(
                         "({} {})",
-                        name,
+                        symbol_to_string(name),
                         args.iter()
                             .map(|id| self.id_to_sexp(venv, id))
                             .collect::<RawResult<Vec<_>>>()?
@@ -724,6 +927,7 @@ impl Model {
                 trigger,
                 used,
             } => {
+                let qident = quantifier.clone();
                 let quantifier = self.term(quantifier)?;
                 if let Term::Quant {
                     name,
@@ -760,6 +964,10 @@ impl Model {
                                 self.id_to_sexp(&global_venv, &terms[i])?
                             );
                         }
+                        
+                        println!("The quantifier was {:?} came from {:?}", 
+                            &qident,
+                            self.get_parent(&qident));
                     }
                     if self.config.with_qi_used_terms {
                         // Print 'used' terms.
@@ -804,15 +1012,21 @@ impl Model {
                                 }
                             }
                         }
+                        terms_string = terms_string.replace("|", "");
                         for instance in &inst.instances {
-                            if let Term::Proof { property, .. } = self
-                                .term(instance.term.as_ref().ok_or(RawError::MissingIdentifier)?)?
-                            {
+                            let instance_term = self
+                                .term(instance.term.as_ref().ok_or(RawError::MissingIdentifier)?)?;
+                            if let Term::Proof { property, .. } = instance_term {
                                 let p = self.term(property)?;
                                 println!(
-                                    "(assert (! {} :named |{}{}|))",
+                                    "(assert (! {} :named |NN{}{}{}|))",
                                     self.term_to_sexp(&global_venv, p)?,
-                                    quantifier_name,
+                                    next_id(),
+                                    if quantifier_name.starts_with("|") {
+                                        &quantifier_name[1..quantifier_name.len() - 2]
+                                    } else {
+                                        quantifier_name
+                                    },
                                     terms_string
                                 );
                             }
@@ -1285,6 +1499,8 @@ impl LogVisitor for &mut Model {
         }
 
         let quantifier = frame.quantifier();
+        let frame_clone = frame.clone();
+
         self.term_data_mut(quantifier)?.instantiations.push(key);
         self.instantiations.insert(
             key,
@@ -1295,6 +1511,18 @@ impl LogVisitor for &mut Model {
                 proof_deps,
             },
         );
+
+        let name = self.global_id_to_sexp(frame_clone.quantifier())?;
+
+        if false && !name.contains("basic") {
+            println!("found quantifier instantiation {}\n{:?}",
+                    name,
+                    frame_clone.terms().iter()
+                    .map(|id| self.global_id_to_sexp(id))
+                    .collect::<RawResult<Vec<_>>>()?
+                    .join(" ")
+                );
+        }
         Ok(())
     }
 
@@ -1329,6 +1557,27 @@ impl LogVisitor for &mut Model {
             .pending_instances
             .pop()
             .ok_or(RawError::InvalidEndOfInstance)?;
+
+        let inst = self
+            .instantiations
+            .get(&key)
+            .ok_or(RawError::InvalidInstanceKey)?;
+
+        if !inst.frame.quantifier().is_builtin() {
+            let hash = self.auto_hash_term(inst.frame.quantifier())?;
+
+            // println!("Key {:?} is {:?} hashed {:?}", key, inst.frame.quantifier(), hash);
+
+            if let Some(t) = &instance.term {
+                for unknown_id in self.find_unknown_quantifiers(t)? {
+                    if unknown_id != hash {
+                        // println!("adding {:?} to {:?}", unknown_id, key);
+                        self.known_quantifiers.insert(unknown_id, key);
+                    }
+                }
+            }
+        }
+
         let inst = self
             .instantiations
             .get_mut(&key)

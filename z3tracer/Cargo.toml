@@ -27,6 +27,7 @@ plotters = { version = "0.3.0", optional = true }
 multiset = { version = "0.0.5", optional = true }
 
 [features]
+default = ["report"]
 report = ["plotters", "multiset"]
 
 [dev-dependencies]
